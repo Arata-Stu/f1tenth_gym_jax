@@ -155,6 +155,9 @@ def make(env_id: str, **env_kwargs):
         timestep_ratio,
         max_steps,
     ) = _parse_scenario(env_id)
+    external_scan_hook = env_kwargs.pop("external_scan_hook", None)
+    scan_corruption_hook = env_kwargs.pop("scan_corruption_hook", None)
+    scan_only_observation = env_kwargs.pop("scan_only_observation", False)
     param_kwargs = {
         "map_name": map_name,
         "produce_scans": produce_scan,
@@ -185,6 +188,9 @@ def make(env_id: str, **env_kwargs):
     env = F110Env(
         num_agents=num_agents,
         params=Param(**param_kwargs),
+        external_scan_hook=external_scan_hook,
+        scan_corruption_hook=scan_corruption_hook,
+        scan_only_observation=scan_only_observation,
     )
 
     return env

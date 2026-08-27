@@ -255,7 +255,7 @@ def convert_track(track, track_int, track_ext, track_name, outdir):
     centerline_filepath = track_dir / f"{track_name}_centerline.csv"
     width_m = MAP_RESOLUTION * TRACK_WIDTH
     with open(centerline_filepath, "w") as waypoints_csv:
-        waypoints_csv.write("# x,y,w_left,w_right\n")
+        waypoints_csv.write("# x,y,w_right,w_left\n")
         for row in xy_pixels:
             waypoints_csv.write(
                 f"{MAP_RESOLUTION * row[0]}, {MAP_RESOLUTION * row[1]}, {width_m}, {width_m}\n"

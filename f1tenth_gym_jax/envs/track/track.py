@@ -71,6 +71,8 @@ class Track:
     psis: Optional[np.ndarray] = None
     kappas: Optional[np.ndarray] = None
     accxs: Optional[np.ndarray] = None
+    left_widths: Optional[np.ndarray] = None
+    right_widths: Optional[np.ndarray] = None
 
     def __init__(
         self,
@@ -91,6 +93,8 @@ class Track:
         accxs: Optional[np.ndarray] = None,
         waypoints: Optional[np.ndarray] = None,
         s_frame_max: Optional[float] = None,
+        left_widths: Optional[np.ndarray] = None,
+        right_widths: Optional[np.ndarray] = None,
     ):
         """
         Initialize track object.
@@ -147,7 +151,35 @@ class Track:
             xs, ys, psis, kappas, velxs, accxs
         )
         self.raceline = raceline or CubicSplineND(xs, ys, psis, kappas, velxs, accxs)
+        self.left_widths, self.right_widths = self._validate_boundary_widths(
+            left_widths,
+            right_widths,
+        )
         self.s_guess = 0.0
+
+    def _validate_boundary_widths(self, left_widths, right_widths):
+        if (left_widths is None) != (right_widths is None):
+            raise ValueError("left_widths and right_widths must be provided together")
+        if left_widths is None:
+            return None, None
+
+        left = np.asarray(left_widths, dtype=float)
+        right = np.asarray(right_widths, dtype=float)
+        expected_shape = np.asarray(self.centerline.s).shape
+        if left.ndim == 1 and left.shape[0] + 1 == expected_shape[0]:
+            left = np.append(left, left[0])
+        if right.ndim == 1 and right.shape[0] + 1 == expected_shape[0]:
+            right = np.append(right, right[0])
+        if left.shape != expected_shape or right.shape != expected_shape:
+            raise ValueError(
+                "boundary widths must match the centerline sample shape "
+                f"{expected_shape}"
+            )
+        if not np.all(np.isfinite(left)) or not np.all(np.isfinite(right)):
+            raise ValueError("boundary widths must be finite")
+        if np.any(left < 0.0) or np.any(right < 0.0):
+            raise ValueError("boundary widths must be non-negative")
+        return left, right
 
     @staticmethod
     def from_track_name(map_name: str):
@@ -175,17 +207,20 @@ class Track:
             # get centerline spline here
             cl_data = np.loadtxt(centerline_path, delimiter=",")
             cl_data = _validate_waypoint_table(
-                cl_data, "centerline", 4, "[x, y, w_left, w_right]"
+                cl_data, "centerline", 4, "[x, y, w_right, w_left]"
             )
             if cl_data.shape[1] != 4:
                 raise ValueError(
-                    "expected centerline columns as [x, y, w_left, w_right]"
+                    "expected centerline columns as [x, y, w_right, w_left]"
                 )
             cl_xs, cl_ys = cl_data[:, 0], cl_data[:, 1]
+            cl_right_widths, cl_left_widths = cl_data[:, 2], cl_data[:, 3]
             cl_psis = _calc_yaw_from_xy(cl_xs, cl_ys)
             cl_xs = np.append(cl_xs, cl_xs[0])
             cl_ys = np.append(cl_ys, cl_ys[0])
             cl_psis = np.append(cl_psis, cl_psis[0])
+            cl_left_widths = np.append(cl_left_widths, cl_left_widths[0])
+            cl_right_widths = np.append(cl_right_widths, cl_right_widths[0])
             centerline = CubicSplineND(cl_xs, cl_ys, cl_psis)
         else:
             raise ValueError("At least centerline file is expected to construct track.")
@@ -225,6 +260,8 @@ class Track:
             oy=oy,
             oyaw=oyaw,
             filepath=map_path,
+            left_widths=cl_left_widths,
+            right_widths=cl_right_widths,
         )
 
     @staticmethod
@@ -451,6 +488,73 @@ class Track:
         return jnp.asarray(
             jax.vmap(self.cartesian_to_frenet_jax, in_axes=(0, 0, 0))(x, y, phi)
         ).T
+
+    @property
+    def has_boundaries(self) -> bool:
+        """Whether sampled left/right centerline widths are available."""
+
+        return self.left_widths is not None
+
+    @partial(jax.jit, static_argnums=(0,))
+    def boundary_widths_jax(self, s):
+        """Interpolate ``[left, right]`` widths at arbitrary Frenet ``s``.
+
+        The returned shape is ``s.shape + (2,)``.  Width samples are periodic
+        and follow the centerline arc-length samples loaded from the generic
+        four-column centerline CSV.
+        """
+
+        if not self.has_boundaries:
+            raise ValueError("track does not provide centerline boundary widths")
+
+        sample_s = jnp.asarray(self.centerline.s)
+        left = jnp.asarray(self.left_widths)
+        right = jnp.asarray(self.right_widths)
+        query = jnp.mod(jnp.asarray(s), self.s_frame_max)
+        lower = jnp.searchsorted(sample_s, query, side="right") - 1
+        lower = jnp.clip(lower, 0, sample_s.shape[0] - 2)
+        upper = lower + 1
+        segment_length = sample_s[upper] - sample_s[lower]
+        safe_segment_length = jnp.where(
+            segment_length > 0.0, segment_length, 1.0
+        )
+        fraction = (query - sample_s[lower]) / safe_segment_length
+        left_at_s = left[lower] + fraction * (left[upper] - left[lower])
+        right_at_s = right[lower] + fraction * (right[upper] - right[lower])
+        return jnp.stack((left_at_s, right_at_s), axis=-1)
+
+    @partial(jax.jit, static_argnums=(0,))
+    def is_off_track_frenet_jax(self, frenet_poses, clearance=0.0):
+        """Return off-track flags for ``[..., 3]`` Frenet pose arrays.
+
+        Positive lateral error points toward the left boundary. ``clearance``
+        shrinks both permitted widths, which can account for a vehicle radius
+        or another caller-selected safety margin.
+        """
+
+        poses = jnp.asarray(frenet_poses)
+        if poses.ndim < 1 or poses.shape[-1] != 3:
+            raise ValueError("frenet_poses must have trailing shape [3]")
+        widths = self.boundary_widths_jax(poses[..., 0])
+        margin = jnp.maximum(jnp.asarray(clearance, dtype=widths.dtype), 0.0)
+        permitted_left = widths[..., 0] - margin
+        permitted_right = widths[..., 1] - margin
+        lateral_error = poses[..., 1]
+        return (lateral_error > permitted_left) | (
+            lateral_error < -permitted_right
+        )
+
+    @partial(jax.jit, static_argnums=(0,))
+    def is_off_track_cartesian_jax(self, cartesian_poses, clearance=0.0):
+        """Return off-track flags for ``[..., 3]`` x/y/yaw pose arrays."""
+
+        poses = jnp.asarray(cartesian_poses)
+        if poses.ndim < 1 or poses.shape[-1] != 3:
+            raise ValueError("cartesian_poses must have trailing shape [3]")
+        flat_poses = poses.reshape((-1, 3))
+        frenet_poses = self.vmap_cartesian_to_frenet_jax(flat_poses)
+        flags = self.is_off_track_frenet_jax(frenet_poses, clearance)
+        return flags.reshape(poses.shape[:-1])
 
     def curvature(self, s):
         """

@@ -66,6 +66,43 @@ Longer example usage lives in:
 - `examples/benchmark_example.ipynb`
 - `examples/rendering_example.ipynb`
 
+## Array transitions and scan hooks
+
+The legacy agent-dictionary API remains available. For loop-free all-agent
+composition, `step_env_array` accepts actions shaped `[agents, 2]` and returns
+an `ArrayStepResult` with separate `[agents]` `terminated` and `truncated`
+flags. `step_array` provides the same result shape with collector-style
+auto-reset behavior.
+
+Scan-enabled environments accept static JAX callables at construction time:
+
+```python
+def dynamic_ranges(key, updated_state, current_ranges):
+    # Return [agents, beams]. The environment minimum-combines these ranges.
+    return external_geometry(updated_state.cartesian_states)
+
+def corrupt_scan(key, updated_state, ranges):
+    # Return a transformed [agents, beams] scan.
+    return corruption_model(key, ranges)
+
+env = make(
+    "Spielberg_4_scan_collision_progress_acceleration+steeringvelocity_1_500_v0",
+    external_scan_hook=dynamic_ranges,
+    scan_corruption_hook=corrupt_scan,
+    scan_only_observation=True,
+)
+```
+
+The composition order is raw map scan, external-range minimum, Gaussian sensor
+noise, then scan corruption. Per-transition arrays can be supplied through
+`external_scan_ranges` and `scan_corruption_ranges`; the latter replaces the
+combined scan. External reset entry points accept Cartesian poses, Frenet
+poses, full Cartesian dynamic-state arrays, or a complete environment `State`.
+
+Tracks loaded from four-column centerline CSV files retain their sampled right
+and left widths. `boundary_widths_jax`, `is_off_track_frenet_jax`, and
+`is_off_track_cartesian_jax` expose periodic, vectorized boundary queries.
+
 ## Visualization
 
 Rollout examples can write a self-contained HTML dashboard:

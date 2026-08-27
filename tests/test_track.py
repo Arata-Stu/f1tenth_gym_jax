@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+import jax.numpy as jnp
 import numpy as np
 import yaml
 from PIL import Image
@@ -46,10 +47,10 @@ class TestTrack(unittest.TestCase):
             )
         centerline = np.array(
             [
-                [0.0, 0.0, 1.0, 1.0],
-                [1.0, 0.0, 1.0, 1.0],
-                [1.0, 1.0, 1.0, 1.0],
-                [0.0, 1.0, 1.0, 1.0],
+                [0.0, 0.0, 0.75, 1.25],
+                [1.0, 0.0, 0.75, 1.25],
+                [1.0, 1.0, 0.75, 1.25],
+                [0.0, 1.0, 0.75, 1.25],
             ]
         )
         np.savetxt(
@@ -102,6 +103,47 @@ class TestTrack(unittest.TestCase):
 
         self.assertEqual(track.filepath, track_dir / "Space Map.png")
         self.assertGreater(track.centerline.s[-1], 0.0)
+
+    def test_centerline_widths_support_jax_off_track_queries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_minimal_map(pathlib.Path(tmpdir), "BoundaryMap")
+
+            with patch.dict(os.environ, {"F1TENTH_GYM_JAX_MAP_DIR": tmpdir}):
+                track = Track.from_track_name("BoundaryMap")
+
+        self.assertTrue(track.has_boundaries)
+        self.assertEqual(track.left_widths.shape, track.centerline.s.shape)
+        self.assertEqual(track.right_widths.shape, track.centerline.s.shape)
+        widths = track.boundary_widths_jax(jnp.array([0.0, 0.5]))
+        self.assertTrue(
+            bool(jnp.allclose(widths, jnp.array([[1.25, 0.75], [1.25, 0.75]])))
+        )
+
+        frenet_poses = jnp.array(
+            [
+                [0.25, 0.9, 0.0],
+                [0.25, 1.3, 0.0],
+                [0.25, -0.8, 0.0],
+            ]
+        )
+        self.assertTrue(
+            bool(
+                jnp.array_equal(
+                    track.is_off_track_frenet_jax(frenet_poses),
+                    jnp.array([False, True, True]),
+                )
+            )
+        )
+        self.assertTrue(
+            bool(track.is_off_track_frenet_jax(frenet_poses[0], clearance=0.4))
+        )
+
+        cartesian_poses = track.vmap_frenet_to_cartesian_jax(
+            jnp.array([[0.25, 0.0, 0.0], [0.25, 10.0, 0.0]])
+        )
+        cartesian_flags = track.is_off_track_cartesian_jax(cartesian_poses)
+        self.assertFalse(bool(cartesian_flags[0]))
+        self.assertTrue(bool(cartesian_flags[1]))
 
     def test_map_lookup_ignores_non_directory_name_matches(self):
         with tempfile.TemporaryDirectory() as tmpdir:
